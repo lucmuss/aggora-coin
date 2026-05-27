@@ -1,0 +1,25 @@
+services:
+  aggora-coin:
+    build:
+      context: .
+    image: aggora-coin:local
+    restart: unless-stopped
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,aggora_rest=debug,aggora_state=debug}
+      AGORA_OPERATOR_SECRET: ${AGORA_OPERATOR_SECRET:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}
+      AGGORA_COIN_BIND: 0.0.0.0:8080
+    ports:
+      - "${AGGORA_COIN_PORT:-18081}:8080"
+    volumes:
+      - aggora-coin-data:/app/data
+      - aggora-coin-snapshots:/app/snapshots
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  aggora-coin-data:
+  aggora-coin-snapshots:

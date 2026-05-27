@@ -1,0 +1,6 @@
+/target/
+/data/
+/snapshots/*.json
+!.gitkeep
+.env
+.DS_Store
