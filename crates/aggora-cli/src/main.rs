@@ -1,4 +1,5 @@
 use aggora_crypto::{canonical_request_message, operator_id_from_public_key, public_key_from_secret_hex, sign_with_secret_hex};
+use aggora_economy::{run_simulation, SimConfig, SimMetrics};
 use aggora_rest::serve;
 use aggora_state::{CoinState, NodeConfig};
 use aggora_types::SystemParameters;
@@ -50,6 +51,44 @@ enum Command {
         iterations: u64,
         #[arg(long, env = "AGGORA_COIN_CONFIG", default_value = "config/default.toml")]
         config: PathBuf,
+    },
+    /// Run a deterministic synthetic economic simulation and print per-iteration CSV metrics.
+    ///
+    /// This drives the real iteration engine over a synthetic population so the economic model
+    /// can be validated and tuned. Parameter flags override the loaded config for the run.
+    Simulate {
+        #[arg(long, env = "AGGORA_COIN_CONFIG", default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 24)]
+        iterations: u64,
+        #[arg(long, default_value_t = 100)]
+        initial_wallets: u64,
+        #[arg(long, default_value_t = 0.8)]
+        wealth_sigma: f64,
+        #[arg(long, default_value_t = 5.0)]
+        tx_per_wallet: f64,
+        #[arg(long, default_value_t = 0.05)]
+        transfer_fraction: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Override economy.growth_factor_per_iteration.
+        #[arg(long)]
+        growth_factor: Option<f64>,
+        /// Override economy.penalty_rate.
+        #[arg(long)]
+        penalty_rate: Option<f64>,
+        /// Override economy.target_penalty_share_of_supply.
+        #[arg(long)]
+        target_penalty_share: Option<f64>,
+        /// Override economy.faucet_share_of_penalty.
+        #[arg(long)]
+        faucet_share: Option<f64>,
+        /// Override economy.burn_base.
+        #[arg(long)]
+        burn_base: Option<f64>,
+        /// Override economy.inverse_balance_weight.
+        #[arg(long)]
+        inverse_balance_weight: Option<f64>,
     },
 }
 
@@ -106,6 +145,54 @@ async fn main() -> Result<()> {
             let state = CoinState::open(NodeConfig::from_parameters(parameters)).await?;
             let status = state.run_simulation_iterations(iterations).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Command::Simulate {
+            config,
+            iterations,
+            initial_wallets,
+            wealth_sigma,
+            tx_per_wallet,
+            transfer_fraction,
+            seed,
+            growth_factor,
+            penalty_rate,
+            target_penalty_share,
+            faucet_share,
+            burn_base,
+            inverse_balance_weight,
+        } => {
+            let mut parameters = load_parameters(&config)?;
+            if let Some(value) = growth_factor {
+                parameters.growth.growth_factor_per_iteration = value;
+            }
+            if let Some(value) = penalty_rate {
+                parameters.economy.penalty_rate = value;
+            }
+            if let Some(value) = target_penalty_share {
+                parameters.economy.target_penalty_share_of_supply = value;
+            }
+            if let Some(value) = faucet_share {
+                parameters.economy.faucet_share_of_penalty = value;
+            }
+            if let Some(value) = burn_base {
+                parameters.economy.burn_base = value;
+            }
+            if let Some(value) = inverse_balance_weight {
+                parameters.economy.inverse_balance_weight = value;
+            }
+            let sim_config = SimConfig {
+                initial_wallets,
+                initial_wealth_sigma: wealth_sigma,
+                iterations,
+                tx_per_wallet_mean: tx_per_wallet,
+                transfer_fraction_mean: transfer_fraction,
+                rng_seed: seed,
+            };
+            let metrics = run_simulation(&parameters, &sim_config)?;
+            println!("{}", SimMetrics::csv_header());
+            for row in &metrics {
+                println!("{}", row.to_csv_row());
+            }
         }
     }
     Ok(())

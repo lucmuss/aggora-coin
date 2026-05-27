@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 aggora-crypto.workspace = true
+aggora-economy.workspace = true
 aggora-rest.workspace = true
 aggora-state.workspace = true
 aggora-types.workspace = true

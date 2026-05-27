@@ -199,6 +199,8 @@ pub struct SystemState {
     pub last_poh_hash: Hash,
     pub previous_iteration_supply: MicroAgc,
     pub last_inflation: f64,
+    #[serde(default)]
+    pub last_gini: f64,
     pub iteration_lock: bool,
 }
 
@@ -214,6 +216,7 @@ impl Default for SystemState {
             last_poh_hash: "00".repeat(32),
             previous_iteration_supply: 0,
             last_inflation: 0.0,
+            last_gini: 0.0,
             iteration_lock: false,
         }
     }

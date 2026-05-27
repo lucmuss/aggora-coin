@@ -10,5 +10,7 @@ rust-version.workspace = true
 aggora-crypto.workspace = true
 aggora-types.workspace = true
 anyhow.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 serde.workspace = true
 tracing.workspace = true

@@ -7,6 +7,7 @@ name = "aggora-cli"
 version = "0.1.0"
 dependencies = [
  "aggora-crypto",
+ "aggora-economy",
  "aggora-rest",
  "aggora-state",
  "aggora-types",
@@ -45,6 +46,8 @@ dependencies = [
  "aggora-crypto",
  "aggora-types",
  "anyhow",
+ "rand",
+ "rand_chacha",
  "serde",
  "tracing",
 ]

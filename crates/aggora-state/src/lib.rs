@@ -9,7 +9,11 @@ use aggora_storage::CoinStorage;
 use aggora_types::*;
 use anyhow::Result;
 use serde::Serialize;
-use std::{collections::BTreeSet, env, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    env,
+    sync::Arc,
+};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
@@ -90,6 +94,7 @@ struct Inner {
     operator_id: String,
     validator_id: String,
     simulation: Mutex<SimulationStatus>,
+    seen_operator_sigs: Mutex<HashMap<String, i64>>,
 }
 
 impl CoinState {
@@ -154,6 +159,7 @@ impl CoinState {
                     mode: "idle".to_string(),
                     iterations_executed: 0,
                 }),
+                seen_operator_sigs: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -245,6 +251,24 @@ impl CoinState {
         Ok(operator)
     }
 
+    /// Rejects a replayed operator signature within the timestamp-drift window.
+    ///
+    /// Operator requests are authenticated over (method, path, timestamp, body) only, so an
+    /// identical signed request is byte-for-byte replayable until its timestamp drifts out of
+    /// the accepted window. For non-idempotent mints (`/charge`) that would mean a double mint,
+    /// so we keep a short-lived in-memory set of seen signatures and prune expired entries.
+    async fn guard_operator_replay(&self, signature: &str, timestamp: i64) -> Result<(), StateError> {
+        let drift = self.parameters().await.security.timestamp_drift_ms.max(0);
+        let now = now_ms();
+        let mut seen = self.inner.seen_operator_sigs.lock().await;
+        seen.retain(|_, ts| (now - *ts).abs() <= drift);
+        if seen.contains_key(signature) {
+            return Err(StateError::InvalidSignature);
+        }
+        seen.insert(signature.to_string(), timestamp);
+        Ok(())
+    }
+
     pub async fn create_wallet(
         &self,
         request: WalletCreateRequest,
@@ -257,13 +281,15 @@ impl CoinState {
         }
         let public_key = normalize_bytes_to_hex(&request.public_key, 32).map_err(|err| StateError::BadRequest(err.to_string()))?;
         let wallet_id = wallet_id_from_public_key(&public_key).map_err(|err| StateError::BadRequest(err.to_string()))?;
-        if self.inner.storage.get_wallet(&wallet_id)?.is_some() {
-            return Err(StateError::WalletAlreadyExists);
-        }
 
         let mut system = self.inner.system.write().await;
         if system.iteration_lock {
             return Err(StateError::IterationInProgress);
+        }
+        // Existence check must hold the same lock as the insert, otherwise two concurrent
+        // creates for the same public key could both pass the check (TOCTOU).
+        if self.inner.storage.get_wallet(&wallet_id)?.is_some() {
+            return Err(StateError::WalletAlreadyExists);
         }
         let tick = system.current_tick + 1;
         let amount = micro_seed(&parameters);
@@ -295,9 +321,9 @@ impl CoinState {
         self.inner.storage.put_wallet(&wallet)?;
         system.total_supply = system.total_supply.saturating_add(amount);
         system.n_wallets = system.n_wallets.saturating_add(1);
+        system.n_active_wallets = system.n_active_wallets.saturating_add(1);
         self.append_tx_locked(&mut system, &tx)?;
         self.inner.storage.store_state(&system)?;
-        self.inner.storage.flush()?;
         Ok(WalletCreateResponse {
             wallet_id,
             public_key,
@@ -313,18 +339,20 @@ impl CoinState {
         operator: &Operator,
         operator_sig: String,
     ) -> Result<TxAcceptedResponse, StateError> {
+        if request.amount == 0 {
+            return Err(StateError::BadRequest("amount must be greater than zero".to_string()));
+        }
+        // Minting is non-idempotent: reject a replayed operator signature before applying it.
+        self.guard_operator_replay(&operator_sig, request.timestamp).await?;
+        let mut system = self.inner.system.write().await;
+        if system.iteration_lock {
+            return Err(StateError::IterationInProgress);
+        }
         let mut wallet = self
             .inner
             .storage
             .get_wallet(&request.to)?
             .ok_or(StateError::WalletNotFound)?;
-        if request.amount == 0 {
-            return Err(StateError::BadRequest("amount must be greater than zero".to_string()));
-        }
-        let mut system = self.inner.system.write().await;
-        if system.iteration_lock {
-            return Err(StateError::IterationInProgress);
-        }
         let tick = system.current_tick + 1;
         wallet.balance = wallet.balance.saturating_add(request.amount);
         let tx_id = mint_tx_id(
@@ -351,7 +379,6 @@ impl CoinState {
         system.total_supply = system.total_supply.saturating_add(request.amount);
         self.append_tx_locked(&mut system, &tx)?;
         self.inner.storage.store_state(&system)?;
-        self.inner.storage.flush()?;
         Ok(TxAcceptedResponse { tx_id, tick })
     }
 
@@ -367,8 +394,16 @@ impl CoinState {
             return Err(StateError::InvalidSignature);
         }
         let tx_id = transfer_tx_id(&request)?;
+        let sender_pubkey = normalize_bytes_to_hex(&request.sender_pubkey, 32).map_err(|_| StateError::InvalidSignature)?;
         self.verify_user_signature(&request.sender_pubkey, &tx_id, &request.user_sig).await?;
 
+        // Read-validate-mutate must all happen under the same lock: reading balance/nonce
+        // before locking would let two concurrent transfers from one wallet both pass the
+        // checks against the same stale snapshot and double-spend.
+        let mut system = self.inner.system.write().await;
+        if system.iteration_lock {
+            return Err(StateError::IterationInProgress);
+        }
         let mut from_wallet = self
             .inner
             .storage
@@ -385,21 +420,24 @@ impl CoinState {
         if from_wallet.balance < request.amount {
             return Err(StateError::InsufficientBalance);
         }
-
-        let mut system = self.inner.system.write().await;
-        if system.iteration_lock {
-            return Err(StateError::IterationInProgress);
-        }
         let tick = system.current_tick + 1;
+        let iteration = system.current_iteration;
+        let mut newly_active = 0u64;
+        if from_wallet.last_active_iteration != iteration {
+            newly_active += 1;
+        }
+        if to_wallet.last_active_iteration != iteration {
+            newly_active += 1;
+        }
         from_wallet.balance -= request.amount;
         from_wallet.nonce += 1;
         from_wallet.iteration_tx_count += 1;
         from_wallet.iteration_counterparties.insert(request.to.clone());
-        from_wallet.last_active_iteration = system.current_iteration;
+        from_wallet.last_active_iteration = iteration;
         to_wallet.balance = to_wallet.balance.saturating_add(request.amount);
         to_wallet.iteration_tx_count += 1;
         to_wallet.iteration_counterparties.insert(request.from.clone());
-        to_wallet.last_active_iteration = system.current_iteration;
+        to_wallet.last_active_iteration = iteration;
 
         let tx = Transaction::Transfer(TransferTx {
             tx_id: tx_id.clone(),
@@ -408,15 +446,14 @@ impl CoinState {
             amount: request.amount,
             nonce: request.nonce,
             timestamp: request.timestamp,
-            sender_pubkey: normalize_bytes_to_hex(&request.sender_pubkey, 32).map_err(|_| StateError::InvalidSignature)?,
+            sender_pubkey,
             user_sig: request.user_sig,
         });
         self.inner.storage.put_wallet(&from_wallet)?;
         self.inner.storage.put_wallet(&to_wallet)?;
         self.append_tx_locked(&mut system, &tx)?;
-        system.n_active_wallets = self.count_active_wallets(system.current_iteration)?;
+        system.n_active_wallets = system.n_active_wallets.saturating_add(newly_active);
         self.inner.storage.store_state(&system)?;
-        self.inner.storage.flush()?;
         Ok(TxAcceptedResponse { tx_id, tick })
     }
 
@@ -429,7 +466,13 @@ impl CoinState {
             return Err(StateError::InvalidSignature);
         }
         let tx_id = burn_tx_id(&request)?;
+        let sender_pubkey = normalize_bytes_to_hex(&request.sender_pubkey, 32).map_err(|_| StateError::InvalidSignature)?;
         self.verify_user_signature(&request.sender_pubkey, &tx_id, &request.user_sig).await?;
+
+        let mut system = self.inner.system.write().await;
+        if system.iteration_lock {
+            return Err(StateError::IterationInProgress);
+        }
         let mut wallet = self
             .inner
             .storage
@@ -441,30 +484,27 @@ impl CoinState {
         if wallet.balance < request.amount {
             return Err(StateError::InsufficientBalance);
         }
-        let mut system = self.inner.system.write().await;
-        if system.iteration_lock {
-            return Err(StateError::IterationInProgress);
-        }
         let tick = system.current_tick + 1;
+        let iteration = system.current_iteration;
+        let newly_active = if wallet.last_active_iteration != iteration { 1 } else { 0 };
         wallet.balance -= request.amount;
         wallet.nonce += 1;
         wallet.iteration_tx_count += 1;
-        wallet.last_active_iteration = system.current_iteration;
+        wallet.last_active_iteration = iteration;
         let tx = Transaction::Burn(BurnTx {
             tx_id: tx_id.clone(),
             from: request.from,
             amount: request.amount,
             nonce: request.nonce,
             timestamp: request.timestamp,
-            sender_pubkey: normalize_bytes_to_hex(&request.sender_pubkey, 32).map_err(|_| StateError::InvalidSignature)?,
+            sender_pubkey,
             user_sig: request.user_sig,
         });
         self.inner.storage.put_wallet(&wallet)?;
         system.total_supply = system.total_supply.saturating_sub(request.amount);
         self.append_tx_locked(&mut system, &tx)?;
-        system.n_active_wallets = self.count_active_wallets(system.current_iteration)?;
+        system.n_active_wallets = system.n_active_wallets.saturating_add(newly_active);
         self.inner.storage.store_state(&system)?;
-        self.inner.storage.flush()?;
         Ok(TxAcceptedResponse { tx_id, tick })
     }
 
@@ -485,11 +525,14 @@ impl CoinState {
         let tx = Transaction::IterationCommit(result.commit.clone());
         system.total_supply = result.commit.post_supply;
         system.n_wallets = result.wallets.len() as u64;
-        system.n_active_wallets = 0;
+        // Activity counters reset each iteration; the only wallets already "active" in the new
+        // iteration are the freshly faucet-seeded ones (created_at_iteration == new iteration).
+        system.n_active_wallets = result.commit.new_wallets.len() as u64;
         system.current_iteration = result.commit.iteration_id;
         system.iteration_started_at = system.current_tick;
         system.previous_iteration_supply = result.commit.post_supply;
         system.last_inflation = result.commit.inflation;
+        system.last_gini = compute_gini(&result.wallets);
         system.iteration_lock = false;
         self.append_tx_locked(&mut system, &tx)?;
         self.inner.storage.put_iteration(&result.commit)?;
@@ -526,19 +569,26 @@ impl CoinState {
         Ok(payload)
     }
 
+    /// O(1) stats served entirely from the in-memory system state. The Gini value is the one
+    /// computed at the last iteration commit; recomputing it live would require a full wallet
+    /// scan on every `/stats` call and every WebSocket tick, which does not scale.
     pub async fn stats(&self) -> Result<StatsResponse, StateError> {
         let system = self.system().await;
-        let wallets = self.inner.storage.list_wallets()?;
         Ok(StatsResponse {
             current_tick: system.current_tick,
             current_iteration: system.current_iteration,
             total_supply: system.total_supply,
-            n_wallets: wallets.len() as u64,
+            n_wallets: system.n_wallets,
             n_active_wallets: system.n_active_wallets,
-            gini: compute_gini(&wallets),
+            gini: system.last_gini,
             last_poh_hash: system.last_poh_hash,
             last_inflation: system.last_inflation,
         })
+    }
+
+    /// Exact Gini over the live wallet set (full scan). Use for diagnostics, not hot paths.
+    pub async fn live_gini(&self) -> Result<f64, StateError> {
+        Ok(compute_gini(&self.inner.storage.list_wallets()?))
     }
 
     pub async fn simulation_status(&self) -> SimulationStatus {
@@ -594,16 +644,6 @@ impl CoinState {
         self.inner.storage.put_transaction(tx, system.current_tick)?;
         self.inner.storage.put_poh_entry(&entry)?;
         Ok(())
-    }
-
-    fn count_active_wallets(&self, iteration: IterationId) -> Result<u64, StateError> {
-        Ok(self
-            .inner
-            .storage
-            .list_wallets()?
-            .into_iter()
-            .filter(|wallet| wallet.last_active_iteration == iteration)
-            .count() as u64)
     }
 }
 
