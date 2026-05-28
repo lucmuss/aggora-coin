@@ -1,7 +1,24 @@
+//! HTTP + WebSocket gateway in front of [`aggora_state::CoinState`].
+//!
+//! The router maps every public/admin/operator-signed endpoint listed in the spec (G.2) to a
+//! handler. Each handler:
+//!
+//! 1. Deserializes the body into a typed [`aggora_types`] request.
+//! 2. Applies pre-validation that doesn't need state: rate limits keyed by `ConnectInfo` IP or
+//!    by the wallet id in the body, so a flood of unauthorized traffic can't burn Ed25519
+//!    verifies on the validator.
+//! 3. Calls [`operator_auth`] for operator-signed paths, which delegates to
+//!    [`CoinState::verify_operator_request`].
+//! 4. Forwards to the matching [`CoinState`] method; any [`StateError`] is mapped to the spec
+//!    G.4 error code + HTTP status via [`state_error`].
+//!
+//! Responses always wrap into [`ApiResponse`] so clients see a uniform `{success,data,error,
+//! tick,iteration}` envelope.
+
 use aggora_state::{CoinState, StateError};
 use aggora_types::*;
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{ConnectInfo, Path, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -62,7 +79,13 @@ pub fn router(state: CoinState) -> Router {
 pub async fn serve(state: CoinState, bind: SocketAddr) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     tracing::info!(%bind, "aggora coin REST API listening");
-    axum::serve(listener, router(state)).await?;
+    // `with_connect_info::<SocketAddr>()` makes the client's source address available to
+    // handlers via the `ConnectInfo` extractor, which is what the rate-limiter keys on.
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -82,11 +105,21 @@ async fn genesis_operator(State(state): State<CoinState>) -> Response {
     .await
 }
 
-async fn create_wallet(State(state): State<CoinState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn create_wallet(
+    State(state): State<CoinState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let request = match serde_json::from_slice::<WalletCreateRequest>(&body) {
         Ok(request) => request,
         Err(err) => return error(&state, StatusCode::BAD_REQUEST, "BAD_REQUEST", err.to_string()).await,
     };
+    // Per-IP daily limit applies before signature verification: a flood of unauthorized requests
+    // shouldn't be able to consume CPU on Ed25519 verifies from a single source.
+    if let Err(err) = state.check_wallet_rate_limit(Some(addr.ip())).await {
+        return state_error(&state, err).await;
+    }
     let (operator, sig) = match operator_auth(&state, "POST", "/api/v1/wallet", &headers, &body, false).await {
         Ok(auth) => auth,
         Err(err) => return state_error(&state, err).await,
@@ -117,6 +150,11 @@ async fn transfer(State(state): State<CoinState>, body: Bytes) -> Response {
         Ok(request) => request,
         Err(err) => return error(&state, StatusCode::BAD_REQUEST, "BAD_REQUEST", err.to_string()).await,
     };
+    // Per-wallet per-minute limit, applied before signature verification so a hostile sender
+    // can't burn the validator's CPU by spamming bogus transfers from one wallet id.
+    if let Err(err) = state.check_transfer_rate_limit(&request.from).await {
+        return state_error(&state, err).await;
+    }
     match state.transfer(request).await {
         Ok(response) => ok(&state, StatusCode::ACCEPTED, response).await,
         Err(err) => state_error(&state, err).await,
@@ -380,6 +418,7 @@ async fn state_error(state: &CoinState, err: StateError) -> Response {
         }
         StateError::WalletNotFound => StatusCode::NOT_FOUND,
         StateError::IterationInProgress => StatusCode::CONFLICT,
+        StateError::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
         StateError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let code = err.code().to_string();

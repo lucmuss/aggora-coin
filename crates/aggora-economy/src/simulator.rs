@@ -218,9 +218,12 @@ pub fn run_simulation(parameters: &SystemParameters, config: &SimConfig) -> anyh
             }
         }
 
-        // 3. Advance the local system state for the next inflation computation.
+        // 3. Advance the local system state for the next inflation computation. We record both
+        //    ends of the cycle (start = pre-economics snapshot, end = post-economics supply) so
+        //    the next iteration sees the inflation this cycle produced (spec D.4).
         state.current_iteration = commit.iteration_id;
         state.total_supply = commit.post_supply;
+        state.previous_iteration_start_supply = commit.snapshot_supply;
         state.previous_iteration_supply = commit.post_supply;
         state.last_inflation = commit.inflation;
         state.n_wallets = wallets.len() as u64;

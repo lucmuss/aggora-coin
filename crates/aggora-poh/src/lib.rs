@@ -1,3 +1,15 @@
+//! Proof-of-History entry construction and chain verification.
+//!
+//! A PoH entry binds the previous chain hash, the current tick number, the Merkle root of the
+//! transactions accepted at this tick, and the leader validator id into a BLAKE3 digest. Tick
+//! N's hash depends on tick N-1, so the sequence is a verifiable total order (spec section C.1
+//! and E). [`build_entry`] also signs over `(tick, hash, tx_root)` with the leader's Ed25519
+//! key so followers can authenticate the entry without re-running consensus.
+//!
+//! In the single-validator prototype the state machine calls [`build_entry`] per accepted
+//! transaction; in a multi-validator deployment the leader would batch up to
+//! `max_txs_per_tick` transactions per call.
+
 use aggora_crypto::{blake3_hex, merkle_root_hex, now_ms, sign_with_secret_hex};
 use aggora_types::{Hash, PohEntry, Tick, ValidatorId};
 use anyhow::Result;

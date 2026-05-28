@@ -1,7 +1,12 @@
+# Values selected from 24-iteration deterministic simulations (see docs/parameter-tuning.md).
+# Trajectory at these settings: supply ~2x over 24 iterations (~3% per-iter inflation, well
+# within the adaptive burn's capacity), Gini falls from 0.37 to 0.13 even from a log-normal
+# initial wealth distribution.
+
 [economy]
 initial_seed_agc = 10
 penalty_rate = 0.05
-target_penalty_share_of_supply = 0.03
+target_penalty_share_of_supply = 0.05    # was 0.03; gives the burn rate enough headroom
 burn_base = 0.10
 burn_sensitivity = 0.5
 burn_min = 0.0
@@ -13,11 +18,11 @@ redistribution_active_max = 1.5
 activity_ema_lambda = 0.5
 activity_min_tx_count = 1
 activity_min_counterparties = 1
-inverse_balance_weight = 0.0
+inverse_balance_weight = 0.5             # was 0.0; mild anti-concentration tilt
 residual_policy = "burn"
 
 [growth]
-growth_factor_per_iteration = 0.30
+growth_factor_per_iteration = 0.05       # was 0.30; spec upper bound caused hyperinflation
 max_new_wallets_per_iter = 1000
 charge_eur_to_agc_ratio = 1.0
 

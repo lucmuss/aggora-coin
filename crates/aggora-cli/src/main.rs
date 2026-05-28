@@ -1,3 +1,18 @@
+//! `aggora-node` binary entrypoint.
+//!
+//! The CLI is the single operational surface for running the validator, generating keys,
+//! signing requests, replaying seed files, and driving the deterministic economic simulator.
+//! Each subcommand is a self-contained "verb" — see [`Command`] — and they share only the
+//! [`load_parameters`] helper that reads `config/default.toml` (or whatever the user passes).
+//!
+//! Subcommands map to docs/spec sections as follows:
+//! - `node`        → spec section G/E: run the REST + state machine.
+//! - `keygen`      → spec section C: produce an Ed25519 keypair.
+//! - `sign-request`→ spec section G.1: emit operator headers for a canonical request.
+//! - `sim`         → spec section I: run N on-chain iterations against the configured DB.
+//! - `simulate`    → spec section J + docs/parameter-tuning.md: deterministic synthetic sim.
+//! - `load-seed`   → docs/features.md (seeds): bootstrap initial wallets into the DB.
+
 use aggora_crypto::{canonical_request_message, operator_id_from_public_key, public_key_from_secret_hex, sign_with_secret_hex};
 use aggora_economy::{run_simulation, SimConfig, SimMetrics};
 use aggora_rest::serve;
@@ -51,6 +66,13 @@ enum Command {
         iterations: u64,
         #[arg(long, env = "AGGORA_COIN_CONFIG", default_value = "config/default.toml")]
         config: PathBuf,
+    },
+    /// Load a seed JSON file into the local sled database (bootstrap initial_wallets).
+    LoadSeed {
+        #[arg(long, env = "AGGORA_COIN_CONFIG", default_value = "config/default.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
     },
     /// Run a deterministic synthetic economic simulation and print per-iteration CSV metrics.
     ///
@@ -139,6 +161,15 @@ async fn main() -> Result<()> {
             println!("X-Operator-Public-Key: {public}");
             println!("X-Operator-Timestamp: {timestamp}");
             println!("X-Operator-Signature: {signature}");
+        }
+        Command::LoadSeed { config, file } => {
+            let parameters = load_parameters(&config)?;
+            let raw = fs::read_to_string(&file).with_context(|| format!("read seed {}", file.display()))?;
+            let seed: aggora_types::SeedFile = serde_json::from_str(&raw)
+                .with_context(|| format!("parse seed {}", file.display()))?;
+            let state = CoinState::open(NodeConfig::from_parameters(parameters)).await?;
+            let installed = state.install_seed(seed).await?;
+            println!("installed {installed} wallet(s) from {}", file.display());
         }
         Command::Sim { iterations, config } => {
             let parameters = load_parameters(&config)?;

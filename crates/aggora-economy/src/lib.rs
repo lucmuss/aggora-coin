@@ -53,8 +53,14 @@ pub fn execute_iteration(
     let snapshot_supply: u64 = wallets.iter().map(|w| w.balance).sum();
     let snapshot_n_wallets = wallets.len() as u64;
     let snapshot_gini = compute_gini(&wallets);
-    let inflation = if state.previous_iteration_supply > 0 {
-        (snapshot_supply as f64 - state.previous_iteration_supply as f64) / state.previous_iteration_supply as f64
+    // Inflation of the *previous* iteration per spec D.4: (M_end_prev - M_start_prev) / M_start_prev.
+    // This captures the supply change the last cycle actually produced (faucet mint minus burn),
+    // which is the signal the adaptive burn rate below must react to. Comparing this iteration's
+    // start against the last iteration's end would always read ~0 (transfers are zero-sum), so the
+    // faucet-driven growth would be invisible and the control loop could never close.
+    let inflation = if state.previous_iteration_start_supply > 0 {
+        (state.previous_iteration_supply as f64 - state.previous_iteration_start_supply as f64)
+            / state.previous_iteration_start_supply as f64
     } else {
         0.0
     };

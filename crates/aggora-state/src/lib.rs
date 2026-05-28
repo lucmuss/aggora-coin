@@ -1,3 +1,30 @@
+//! Authoritative state machine for the chain.
+//!
+//! [`CoinState`] is the only component that mutates persistent state. It owns:
+//!
+//! - a [`CoinStorage`] handle (sled trees) for durable data,
+//! - an async `RwLock<SystemState>` whose write half is the *single serialization point* for
+//!   every mutating transaction, so PoH-tick ordering and balance updates can never race,
+//! - an async `RwLock<SystemParameters>` so `/admin/parameters` can hot-swap the economic
+//!   configuration,
+//! - in-memory caches that the REST layer hits on the hot path:
+//!     * `seen_operator_sigs` — replay guard for non-idempotent operator requests,
+//!     * `rate_wallet_create` and `rate_wallet_tx` — sliding-window rate limiters.
+//!
+//! All public mutating methods follow the same pattern:
+//! 1. **Outside the lock**: deserialize, normalize, compute `tx_id`, verify Ed25519
+//!    signatures, and check rate limits. These are the expensive CPU operations and they
+//!    don't need the lock.
+//! 2. **Acquire `system.write()`**: from here on every read/validate/mutate is atomic. The
+//!    wallet read, nonce/balance check, mutation, and write all happen inside the lock so
+//!    concurrent transactions cannot double-spend.
+//! 3. **Append the PoH entry** via [`append_tx_locked`], which bumps `current_tick`,
+//!    rebuilds the chain hash, persists the transaction + secondary index + PoH entry, and
+//!    leaves the updated `SystemState` for the caller to flush.
+//!
+//! See [`docs/features.md`](../../docs/features.md) for the end-to-end map of which REST
+//! endpoint invokes which method here and which sled tree it ultimately writes to.
+
 use aggora_crypto::{
     canonical_request_message, hash_serializable, normalize_bytes_to_hex, now_ms, operator_id_from_public_key,
     public_key_from_secret_hex, tx_signing_message, validator_id_from_public_key, verify_ed25519, wallet_id_from_public_key,
@@ -10,8 +37,9 @@ use aggora_types::*;
 use anyhow::Result;
 use serde::Serialize;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     env,
+    net::IpAddr,
     sync::Arc,
 };
 use thiserror::Error;
@@ -35,6 +63,8 @@ pub enum StateError {
     WalletAlreadyExists,
     #[error("iteration in progress")]
     IterationInProgress,
+    #[error("rate limit exceeded")]
+    RateLimitExceeded,
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error(transparent)]
@@ -51,6 +81,7 @@ impl StateError {
             StateError::OperatorUnauthorized => "OPERATOR_UNAUTHORIZED",
             StateError::WalletAlreadyExists => "WALLET_ALREADY_EXISTS",
             StateError::IterationInProgress => "ITERATION_IN_PROGRESS",
+            StateError::RateLimitExceeded => "RATE_LIMIT_EXCEEDED",
             StateError::BadRequest(_) => "BAD_REQUEST",
             StateError::Internal(_) => "INTERNAL_ERROR",
         }
@@ -95,6 +126,11 @@ struct Inner {
     validator_id: String,
     simulation: Mutex<SimulationStatus>,
     seen_operator_sigs: Mutex<HashMap<String, i64>>,
+    // Sliding-window rate-limit state: per-IP wallet-create timestamps (day window) and
+    // per-wallet outgoing-transfer timestamps (minute window). Bounded by the limits themselves
+    // because old entries are pruned on every check.
+    rate_wallet_create: Mutex<HashMap<IpAddr, VecDeque<i64>>>,
+    rate_wallet_tx: Mutex<HashMap<String, VecDeque<i64>>>,
 }
 
 impl CoinState {
@@ -160,6 +196,8 @@ impl CoinState {
                     iterations_executed: 0,
                 }),
                 seen_operator_sigs: Mutex::new(HashMap::new()),
+                rate_wallet_create: Mutex::new(HashMap::new()),
+                rate_wallet_tx: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -249,6 +287,50 @@ impl CoinState {
             return Err(StateError::InvalidSignature);
         }
         Ok(operator)
+    }
+
+    /// Sliding-window per-IP rate limit for wallet creation (spec K.1: anti-Sybil).
+    ///
+    /// Records the current timestamp and rejects if more than `limit` creates have occurred in
+    /// the trailing 24h window. `None` for `ip` (e.g. unix sockets) skips the limit.
+    pub async fn check_wallet_rate_limit(&self, ip: Option<IpAddr>) -> Result<(), StateError> {
+        let Some(ip) = ip else { return Ok(()) };
+        let limit = self.parameters().await.security.rate_limit_wallet_per_ip_per_day;
+        if limit == 0 {
+            return Ok(());
+        }
+        let window_ms: i64 = 24 * 60 * 60 * 1000;
+        let now = now_ms();
+        let mut guard = self.inner.rate_wallet_create.lock().await;
+        let entry = guard.entry(ip).or_default();
+        while entry.front().map_or(false, |ts| now - *ts > window_ms) {
+            entry.pop_front();
+        }
+        if entry.len() as u64 >= limit {
+            return Err(StateError::RateLimitExceeded);
+        }
+        entry.push_back(now);
+        Ok(())
+    }
+
+    /// Sliding-window per-wallet rate limit for outgoing transfers.
+    pub async fn check_transfer_rate_limit(&self, wallet_id: &str) -> Result<(), StateError> {
+        let limit = self.parameters().await.security.rate_limit_tx_per_wallet_per_minute;
+        if limit == 0 {
+            return Ok(());
+        }
+        let window_ms: i64 = 60 * 1000;
+        let now = now_ms();
+        let mut guard = self.inner.rate_wallet_tx.lock().await;
+        let entry = guard.entry(wallet_id.to_string()).or_default();
+        while entry.front().map_or(false, |ts| now - *ts > window_ms) {
+            entry.pop_front();
+        }
+        if entry.len() as u64 >= limit {
+            return Err(StateError::RateLimitExceeded);
+        }
+        entry.push_back(now);
+        Ok(())
     }
 
     /// Rejects a replayed operator signature within the timestamp-drift window.
@@ -530,6 +612,9 @@ impl CoinState {
         system.n_active_wallets = result.commit.new_wallets.len() as u64;
         system.current_iteration = result.commit.iteration_id;
         system.iteration_started_at = system.current_tick;
+        // Record both ends of this cycle so the next iteration can measure the inflation it
+        // produced (spec D.4): start = pre-economics snapshot, end = post-economics supply.
+        system.previous_iteration_start_supply = result.commit.snapshot_supply;
         system.previous_iteration_supply = result.commit.post_supply;
         system.last_inflation = result.commit.inflation;
         system.last_gini = compute_gini(&result.wallets);
@@ -551,6 +636,76 @@ impl CoinState {
         }
         self.inner.storage.flush()?;
         Ok(result.commit)
+    }
+
+    /// Bootstraps the chain from a seed file: every `SeedWallet` is installed as if it had been
+    /// minted by the genesis operator. Skips wallets whose ids already exist so the call is
+    /// idempotent across restarts. Returns the number of newly created wallets.
+    ///
+    /// This is the admin bootstrap path documented under "scripted seed replay" in the spec;
+    /// it deliberately bypasses operator-signature verification because the seed file itself
+    /// is the authority (it has to be trusted before any operator request can be served).
+    pub async fn install_seed(&self, seed: SeedFile) -> Result<usize, StateError> {
+        let parameters = self.parameters().await;
+        let default_seed = micro_seed(&parameters);
+        let mut system = self.inner.system.write().await;
+        if system.iteration_lock {
+            return Err(StateError::IterationInProgress);
+        }
+        let mut installed = 0usize;
+        for entry in seed.initial_wallets {
+            let public_key = normalize_bytes_to_hex(&entry.public_key, 32)
+                .map_err(|err| StateError::BadRequest(err.to_string()))?;
+            let wallet_id = wallet_id_from_public_key(&public_key)
+                .map_err(|err| StateError::BadRequest(err.to_string()))?;
+            if self.inner.storage.get_wallet(&wallet_id)?.is_some() {
+                continue;
+            }
+            let amount = entry.initial_balance.unwrap_or(default_seed);
+            let tick = system.current_tick + 1;
+            let wallet = Wallet {
+                id: wallet_id.clone(),
+                pubkey: public_key,
+                balance: amount,
+                nonce: 0,
+                created_at_tick: tick,
+                created_at_iteration: system.current_iteration,
+                created_by_operator: self.inner.operator_id.clone(),
+                iteration_tx_count: 0,
+                iteration_counterparties: BTreeSet::new(),
+                last_active_iteration: system.current_iteration,
+                activity_score: 1.0,
+            };
+            let tx_id = mint_tx_id(
+                &wallet_id,
+                amount,
+                0,
+                &self.inner.operator_id,
+                tick,
+                now_ms(),
+                "seed_bootstrap",
+            )?;
+            let tx = Transaction::Mint(MintTx {
+                tx_id,
+                to: wallet_id,
+                amount,
+                eur_amount: 0,
+                operator_id: self.inner.operator_id.clone(),
+                nonce: tick,
+                timestamp: now_ms(),
+                operator_sig: String::new(),
+                category: "seed_bootstrap".to_string(),
+            });
+            self.inner.storage.put_wallet(&wallet)?;
+            system.total_supply = system.total_supply.saturating_add(amount);
+            system.n_wallets = system.n_wallets.saturating_add(1);
+            system.n_active_wallets = system.n_active_wallets.saturating_add(1);
+            self.append_tx_locked(&mut system, &tx)?;
+            installed += 1;
+        }
+        self.inner.storage.store_state(&system)?;
+        self.inner.storage.flush()?;
+        Ok(installed)
     }
 
     pub async fn create_manual_snapshot(&self) -> Result<serde_json::Value, StateError> {

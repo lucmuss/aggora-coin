@@ -1,3 +1,21 @@
+//! All cryptography and canonical-encoding helpers shared by the chain.
+//!
+//! The module is split into three groups:
+//!
+//! 1. **Hashing** — [`blake3_hex`], [`hash_serializable`], [`merkle_root_hex`]. Every on-chain
+//!    identifier (wallet/operator/validator IDs, transaction IDs, PoH hashes, snapshot
+//!    anchors) ultimately funnels through these so we have a single place to audit.
+//! 2. **Encoding** — [`decode_bytes`], [`normalize_bytes_to_hex`], [`fixed_32`], [`fixed_64`].
+//!    Inputs from JSON/HTTP can arrive as either hex or base64; these helpers accept both and
+//!    enforce length so the rest of the codebase never has to parse keys defensively.
+//! 3. **Signing/verification** — [`sign_with_secret_hex`], [`verify_ed25519`],
+//!    [`canonical_request_message`], [`tx_signing_message`]. The two `message` helpers define
+//!    the *exact* byte sequence operator requests and user transactions sign over, so the CLI
+//!    `sign-request` subcommand and the REST gateway can never disagree.
+//!
+//! There is no global state — every function is pure modulo `now_ms()`, which is the only
+//! reason this crate isn't `no_std`-friendly.
+
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::{Signature as DalekSignature, Signer, SigningKey, Verifier, VerifyingKey};

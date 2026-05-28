@@ -1,18 +1,48 @@
+//! Wire types and configuration schema shared by every crate in the workspace.
+//!
+//! Everything here is dependency-free (only `serde` + `std`) on purpose so it can be pulled
+//! into clients, the simulator, or future SDK crates without dragging in sled, ed25519, or
+//! axum. The convention is:
+//!
+//! - Primitive crypto types are *hex-encoded `String`s* on the wire (`WalletId`, `Signature`,
+//!   `Hash`, `PublicKey`). The decoding helpers live in [`aggora_crypto`].
+//! - Numeric balances are unsigned micro-AGC (`MicroAgc` = `u64`); 1 AGC = 1 000 000 µAGC.
+//! - Transactions are an externally-tagged enum (`kind: "transfer" | "mint" | …`) so the
+//!   on-disk JSON is self-describing.
+//! - Every configurable parameter has a `Default` impl that is the production-recommended
+//!   starting value — see [`docs/parameter-tuning.md`](../../docs/parameter-tuning.md) for the
+//!   simulation evidence behind the picks.
+//!
+//! [`aggora_crypto`]: ../aggora_crypto/index.html
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// 32-byte BLAKE3(public_key), hex-encoded. Used as primary key in the `wallets` sled tree.
 pub type WalletId = String;
+/// BLAKE3(operator_public_key), same derivation as `WalletId`.
 pub type OperatorId = String;
+/// BLAKE3(validator_public_key), same derivation as `WalletId`.
 pub type ValidatorId = String;
+/// 32-byte Ed25519 public key, hex-encoded.
 pub type PublicKey = String;
+/// 64-byte Ed25519 signature, hex-encoded.
 pub type Signature = String;
+/// 32-byte BLAKE3 digest, hex-encoded.
 pub type Hash = String;
+/// Atomic balance unit. 1 AGC = `MICRO_AGC_PER_AGC` µAGC, stored as `u64` everywhere.
 pub type MicroAgc = u64;
+/// Monotonic PoH tick index assigned by the state machine on every accepted transaction.
 pub type Tick = u64;
+/// Monotonic iteration counter. 0 at genesis, +1 per economic iteration.
 pub type IterationId = u64;
+/// Per-wallet (or per-operator-request) monotonic counter; the next expected value is stored
+/// on the wallet itself so the state machine can reject replays without a global view.
 pub type Nonce = u64;
+/// Unix milliseconds. Used for both client-supplied timestamps and operator-signature drift.
 pub type Timestamp = i64;
 
+/// Conversion factor between user-facing AGC and the on-chain micro-AGC integer balance unit.
 pub const MICRO_AGC_PER_AGC: MicroAgc = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,18 +76,31 @@ impl Operator {
     }
 }
 
+/// On-chain wallet record stored in the `wallets` sled tree.
+///
+/// The `iteration_*` fields accumulate activity inside the current iteration; the iteration
+/// engine reads them to compute the activity score (EMA over iterations), then resets them.
+/// `activity_score` therefore persists across iterations while the tx counters do not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wallet {
+    /// `WalletId = BLAKE3(pubkey)`; also the sled key.
     pub id: WalletId,
+    /// Ed25519 public key the wallet signs transactions with.
     pub pubkey: PublicKey,
+    /// Current balance in µAGC. Updated atomically under the system lock.
     pub balance: MicroAgc,
+    /// Next expected nonce for outgoing transactions. Incremented after every transfer/burn.
     pub nonce: Nonce,
     pub created_at_tick: Tick,
     pub created_at_iteration: IterationId,
     pub created_by_operator: OperatorId,
+    /// Number of transactions this wallet was involved in during the current iteration.
     pub iteration_tx_count: u32,
+    /// Distinct counterparties this iteration — used by the activity threshold check.
     pub iteration_counterparties: BTreeSet<WalletId>,
+    /// Iteration in which this wallet last participated in a transaction.
     pub last_active_iteration: IterationId,
+    /// Activity EMA in [0,1]; multiplied into the redistribution weight `α`.
     pub activity_score: f64,
 }
 
@@ -127,13 +170,20 @@ pub struct OperatorChangeTx {
     pub operator_sig: Signature,
 }
 
+/// The externally-tagged Transaction enum is the on-chain unit the PoH stream commits to.
+/// `kind: "mint" | "transfer" | "burn" | "iteration_commit" | "operator_change"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Transaction {
+    /// Operator-signed mint (wallet seed or /charge top-up).
     Mint(MintTx),
+    /// User-signed wallet-to-wallet transfer.
     Transfer(TransferTx),
+    /// User-signed self-burn.
     Burn(BurnTx),
+    /// System-generated commit recording the result of an economic iteration.
     IterationCommit(IterationCommit),
+    /// v2 placeholder for adding/revoking operators; rejected in v1.
     OperatorChange(OperatorChangeTx),
 }
 
@@ -188,16 +238,35 @@ pub struct Validator {
     pub last_seen_tick: Tick,
 }
 
+/// Live, mutable system-wide state. Persisted as a single sled key (`system/state`) and
+/// also held in memory by [`aggora_state::CoinState`] under an `RwLock` for hot reads.
+///
+/// Every mutating transaction updates `current_tick`, `last_poh_hash`, the wallet counters,
+/// and `total_supply` *under the same write-lock acquisition*, which is what makes the chain
+/// safe under concurrent REST traffic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemState {
+    /// Strictly monotonic PoH tick index assigned by the state machine.
     pub current_tick: Tick,
+    /// Iteration counter (0 at genesis, +1 per economic iteration).
     pub current_iteration: IterationId,
+    /// Tick at which the current iteration started; used to detect when the next is due.
     pub iteration_started_at: Tick,
+    /// Sum of all wallet balances. Maintained incrementally so `/stats` is O(1).
     pub total_supply: MicroAgc,
+    /// Cached count of wallet records.
     pub n_wallets: u64,
+    /// Wallets that have transacted in `current_iteration`. Reset to the new faucet wallets
+    /// at iteration commit, then incremented in transfer/burn when a wallet first transacts.
     pub n_active_wallets: u64,
     pub last_poh_hash: Hash,
+    // Supply at the *end* of the previous iteration (post-economics). Together with
+    // `previous_iteration_start_supply` this lets the iteration engine measure how much the
+    // previous cycle inflated the supply (spec D.4) and steer the adaptive burn rate.
     pub previous_iteration_supply: MicroAgc,
+    // Supply at the *start* of the previous iteration (pre-economics snapshot).
+    #[serde(default)]
+    pub previous_iteration_start_supply: MicroAgc,
     pub last_inflation: f64,
     #[serde(default)]
     pub last_gini: f64,
@@ -215,6 +284,7 @@ impl Default for SystemState {
             n_active_wallets: 0,
             last_poh_hash: "00".repeat(32),
             previous_iteration_supply: 0,
+            previous_iteration_start_supply: 0,
             last_inflation: 0.0,
             last_gini: 0.0,
             iteration_lock: false,
@@ -272,7 +342,10 @@ impl Default for EconomyParameters {
         Self {
             initial_seed_agc: 10,
             penalty_rate: 0.05,
-            target_penalty_share_of_supply: 0.03,
+            // Selected empirically over 24-iteration simulations (see docs/parameter-tuning.md):
+            // 0.05 keeps the penalty pool large enough that adaptive burn can compensate the
+            // faucet mint at sustainable wallet-growth rates, without crushing larger balances.
+            target_penalty_share_of_supply: 0.05,
             burn_base: 0.10,
             burn_sensitivity: 0.5,
             burn_min: 0.0,
@@ -284,7 +357,9 @@ impl Default for EconomyParameters {
             activity_ema_lambda: 0.5,
             activity_min_tx_count: 1,
             activity_min_counterparties: 1,
-            inverse_balance_weight: 0.0,
+            // Mild inverse-balance tilt accelerates Gini reduction (0.13 -> 0.12 over 24 iter)
+            // without breaking the activity-weighted incentive: γ=0.5 stayed stable in all sweeps.
+            inverse_balance_weight: 0.5,
             residual_policy: ResidualPolicy::Burn,
         }
     }
@@ -307,7 +382,11 @@ pub struct GrowthParameters {
 impl Default for GrowthParameters {
     fn default() -> Self {
         Self {
-            growth_factor_per_iteration: 0.30,
+            // 30% wallet growth per iteration is the spec's upper bound; in simulation it caused
+            // ~20%-per-iteration hyperinflation because faucet mint scales with N while burn
+            // capacity scales with target_penalty_share. 5% keeps inflation below the controller's
+            // ability to react and is the production-recommended starting value.
+            growth_factor_per_iteration: 0.05,
             max_new_wallets_per_iter: 1000,
             charge_eur_to_agc_ratio: 1.0,
         }
@@ -417,6 +496,28 @@ impl Default for SimulationParameters {
             tx_per_active_wallet_mean: 5.0,
         }
     }
+}
+
+/// Schema for the JSON files in `seeds/`. The bootstrap loader walks `initial_wallets` and
+/// installs them through the state machine before any operator/user request arrives, which
+/// lets us reproduce a population for parameter tuning or for live regression scenarios.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SeedFile {
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub initial_wallets: Vec<SeedWallet>,
+    #[serde(default)]
+    pub scripted_events: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedWallet {
+    /// Ed25519 public key (hex or base64); the wallet id is derived from it.
+    pub public_key: PublicKey,
+    /// Initial balance in micro-AGC. If omitted, the configured initial seed is used.
+    #[serde(default)]
+    pub initial_balance: Option<MicroAgc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

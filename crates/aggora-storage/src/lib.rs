@@ -1,3 +1,17 @@
+//! Embedded sled-backed persistence layer.
+//!
+//! [`CoinStorage`] opens one sled database with eight named trees, mirroring the schema in
+//! spec section H. Every method is a thin typed wrapper over `Tree::get` / `Tree::insert` using
+//! `serde_json` so on-disk values are human-inspectable and forward-compatible across struct
+//! evolutions (new fields default cleanly).
+//!
+//! The struct is `Clone` because sled's `Db` and `Tree` are `Arc`-backed; clones share the same
+//! underlying state, which is exactly what the state machine needs to hand storage to async
+//! tasks (e.g. the snapshot writer) without rebuilding handles.
+//!
+//! Durability: sled flushes its log every 500 ms by default. The state machine no longer fsyncs
+//! per transaction — see [`aggora_state::CoinState`] for the higher-level checkpoint policy.
+
 use aggora_types::{
     GiniPoint, IterationCommit, Operator, PohEntry, SupplyPoint, SystemParameters, SystemState, Transaction, Validator, Wallet,
 };
