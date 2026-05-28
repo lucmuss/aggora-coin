@@ -111,6 +111,9 @@ enum Command {
         /// Override economy.inverse_balance_weight.
         #[arg(long)]
         inverse_balance_weight: Option<f64>,
+        /// Optional seed JSON; its scripted_events get loaded into the simulator.
+        #[arg(long)]
+        seed_file: Option<PathBuf>,
     },
 }
 
@@ -191,6 +194,7 @@ async fn main() -> Result<()> {
             faucet_share,
             burn_base,
             inverse_balance_weight,
+            seed_file,
         } => {
             let mut parameters = load_parameters(&config)?;
             if let Some(value) = growth_factor {
@@ -211,14 +215,21 @@ async fn main() -> Result<()> {
             if let Some(value) = inverse_balance_weight {
                 parameters.economy.inverse_balance_weight = value;
             }
-            let sim_config = SimConfig {
+            let mut sim_config = SimConfig {
                 initial_wallets,
                 initial_wealth_sigma: wealth_sigma,
                 iterations,
                 tx_per_wallet_mean: tx_per_wallet,
                 transfer_fraction_mean: transfer_fraction,
                 rng_seed: seed,
+                scripted_events: Vec::new(),
             };
+            if let Some(path) = seed_file {
+                let raw = fs::read_to_string(&path).with_context(|| format!("read seed {}", path.display()))?;
+                let seed: aggora_types::SeedFile = serde_json::from_str(&raw)
+                    .with_context(|| format!("parse seed {}", path.display()))?;
+                sim_config = sim_config.with_seed(&seed);
+            }
             let metrics = run_simulation(&parameters, &sim_config)?;
             println!("{}", SimMetrics::csv_header());
             for row in &metrics {

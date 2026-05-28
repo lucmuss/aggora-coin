@@ -499,8 +499,10 @@ impl Default for SimulationParameters {
 }
 
 /// Schema for the JSON files in `seeds/`. The bootstrap loader walks `initial_wallets` and
-/// installs them through the state machine before any operator/user request arrives, which
-/// lets us reproduce a population for parameter tuning or for live regression scenarios.
+/// installs them through the state machine before any operator/user request arrives. The
+/// simulator additionally consumes `scripted_events` to inject reproducible population
+/// changes and traffic bursts at specific iterations, which is what the spec's "scenario"
+/// suite (J.4) needs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeedFile {
     #[serde(default)]
@@ -508,7 +510,52 @@ pub struct SeedFile {
     #[serde(default)]
     pub initial_wallets: Vec<SeedWallet>,
     #[serde(default)]
-    pub scripted_events: Vec<serde_json::Value>,
+    pub scripted_events: Vec<ScriptedEvent>,
+}
+
+/// One scripted scenario step. Each variant carries an `at_iteration` index that the
+/// simulator dispatches against at the start of that iteration (before synthetic activity).
+///
+/// Unknown variants fall through `Unknown` so older code can still load forward-compatible
+/// seed files without crashing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ScriptedEvent {
+    /// Mint `count` additional faucet-style wallets at the given iteration. Each receives
+    /// `balance` µAGC (defaults to the configured initial_seed).
+    SpawnWallets {
+        at_iteration: IterationId,
+        count: u64,
+        #[serde(default)]
+        balance: Option<MicroAgc>,
+    },
+    /// Inject `n_txs` extra synthetic transfers between random wallets during the named
+    /// iteration. Useful for stress-testing the activity-weighted redistribution.
+    TransferBurst {
+        at_iteration: IterationId,
+        n_txs: u64,
+        /// Fraction of sender balance moved per transfer. Defaults to the simulator's
+        /// configured `transfer_fraction_mean` when omitted.
+        #[serde(default)]
+        fraction: Option<f64>,
+    },
+    /// Operator-style charge burst: mint `amount` µAGC total, split evenly across `n_targets`
+    /// randomly-chosen existing wallets. Simulates external AGC inflows from /charge.
+    ChargeBurst {
+        at_iteration: IterationId,
+        amount: MicroAgc,
+        n_targets: u64,
+    },
+    /// Move `fraction` of every wallet's balance into a single randomly chosen wallet at the
+    /// given iteration. Used to model a sudden wealth-concentration event for stress-testing
+    /// the redistribution mechanism.
+    WealthShock {
+        at_iteration: IterationId,
+        fraction: f64,
+    },
+    /// Forward-compat catch-all so unknown actions don't break old simulators.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

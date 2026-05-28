@@ -8,7 +8,7 @@
 
 use crate::{compute_gini_from_balances, execute_iteration, micro_seed};
 use aggora_crypto::blake3_hex;
-use aggora_types::{SystemParameters, SystemState, Wallet};
+use aggora_types::{ScriptedEvent, SeedFile, SystemParameters, SystemState, Wallet};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::Serialize;
@@ -26,6 +26,10 @@ pub struct SimConfig {
     /// Fraction of the sender balance moved per transfer (mean of a clamped log-normal).
     pub transfer_fraction_mean: f64,
     pub rng_seed: u64,
+    /// Optional scripted scenario events (population/traffic bursts at specific iterations).
+    /// Loaded from `SeedFile::scripted_events`; dispatched at the *start* of each iteration
+    /// before synthetic activity, so the iteration engine sees their effects.
+    pub scripted_events: Vec<ScriptedEvent>,
 }
 
 impl Default for SimConfig {
@@ -37,7 +41,16 @@ impl Default for SimConfig {
             tx_per_wallet_mean: 5.0,
             transfer_fraction_mean: 0.05,
             rng_seed: 0xA66_0_C0_1Eu64,
+            scripted_events: Vec::new(),
         }
+    }
+}
+
+impl SimConfig {
+    /// Pull `scripted_events` from a loaded seed file into this config.
+    pub fn with_seed(mut self, seed: &SeedFile) -> Self {
+        self.scripted_events = seed.scripted_events.clone();
+        self
     }
 }
 
@@ -159,10 +172,25 @@ pub fn run_simulation(parameters: &SystemParameters, config: &SimConfig) -> anyh
     let mut metrics = Vec::with_capacity(config.iterations as usize);
 
     for _ in 0..config.iterations {
+        // 0. Apply any scripted events scheduled for this iteration *before* synthetic
+        //    activity, so transfer bursts can move newly minted balances and population
+        //    changes are visible to the activity loop in step 1. Returns the number of extra
+        //    transfers the events injected so they contribute to the per-iteration n_txs.
+        let current_iter_id = state.current_iteration + 1;
+        let burst_txs = apply_scripted_events(
+            &config.scripted_events,
+            current_iter_id,
+            &mut wallets,
+            &mut next_wallet_idx,
+            &mut rng,
+            seed,
+            config.transfer_fraction_mean,
+        );
+
         // 1. Synthetic activity: move value between wallets so the redistribution/activity
         //    machinery has something to work with.
         let n = wallets.len();
-        let mut n_txs = 0u64;
+        let mut n_txs = burst_txs;
         if n >= 2 {
             for sender_idx in 0..n {
                 let k = sample_poisson(&mut rng, config.tx_per_wallet_mean);
@@ -258,9 +286,147 @@ pub fn run_simulation(parameters: &SystemParameters, config: &SimConfig) -> anyh
     Ok(metrics)
 }
 
+/// Dispatch all scripted events whose `at_iteration` matches `iter_id`. Events execute in
+/// declaration order so a `SpawnWallets` immediately followed by a `TransferBurst` in the
+/// same iteration sees the spawned wallets as valid recipients.
+fn apply_scripted_events(
+    events: &[ScriptedEvent],
+    iter_id: u64,
+    wallets: &mut Vec<Wallet>,
+    next_wallet_idx: &mut u64,
+    rng: &mut ChaCha20Rng,
+    default_seed: u64,
+    default_fraction: f64,
+) -> u64 {
+    let mut extra_txs: u64 = 0;
+    for event in events {
+        match event {
+            ScriptedEvent::SpawnWallets {
+                at_iteration,
+                count,
+                balance,
+            } if *at_iteration == iter_id => {
+                let amount = balance.unwrap_or(default_seed);
+                for _ in 0..*count {
+                    wallets.push(sim_wallet(*next_wallet_idx, amount));
+                    *next_wallet_idx += 1;
+                }
+            }
+            ScriptedEvent::TransferBurst {
+                at_iteration,
+                n_txs,
+                fraction,
+            } if *at_iteration == iter_id => {
+                if wallets.len() < 2 {
+                    continue;
+                }
+                let frac_mean = fraction.unwrap_or(default_fraction);
+                let n = wallets.len();
+                for _ in 0..*n_txs {
+                    let sender_idx = rng.gen_range(0..n);
+                    if wallets[sender_idx].balance == 0 {
+                        continue;
+                    }
+                    let mut recipient_idx = rng.gen_range(0..n);
+                    if recipient_idx == sender_idx {
+                        recipient_idx = (recipient_idx + 1) % n;
+                    }
+                    let frac = (frac_mean * (0.5 * sample_standard_normal(rng)).exp()).clamp(0.0001, 0.95);
+                    let amount = ((wallets[sender_idx].balance as f64 * frac).floor() as u64)
+                        .min(wallets[sender_idx].balance);
+                    if amount == 0 {
+                        continue;
+                    }
+                    let recipient_id = wallets[recipient_idx].id.clone();
+                    let sender_id = wallets[sender_idx].id.clone();
+                    wallets[sender_idx].balance -= amount;
+                    wallets[sender_idx].nonce += 1;
+                    wallets[sender_idx].iteration_tx_count += 1;
+                    wallets[sender_idx].iteration_counterparties.insert(recipient_id);
+                    wallets[recipient_idx].balance = wallets[recipient_idx].balance.saturating_add(amount);
+                    wallets[recipient_idx].iteration_tx_count += 1;
+                    wallets[recipient_idx].iteration_counterparties.insert(sender_id);
+                    extra_txs += 1;
+                }
+            }
+            ScriptedEvent::ChargeBurst {
+                at_iteration,
+                amount,
+                n_targets,
+            } if *at_iteration == iter_id => {
+                if wallets.is_empty() || *n_targets == 0 {
+                    continue;
+                }
+                let per_target = amount / (*n_targets).max(1);
+                let n = wallets.len();
+                for _ in 0..(*n_targets) {
+                    let idx = rng.gen_range(0..n);
+                    wallets[idx].balance = wallets[idx].balance.saturating_add(per_target);
+                }
+            }
+            ScriptedEvent::WealthShock {
+                at_iteration,
+                fraction,
+            } if *at_iteration == iter_id => {
+                if wallets.is_empty() {
+                    continue;
+                }
+                let target_idx = rng.gen_range(0..wallets.len());
+                let target_id = wallets[target_idx].id.clone();
+                let frac = fraction.clamp(0.0, 1.0);
+                let mut moved: u64 = 0;
+                for (i, wallet) in wallets.iter_mut().enumerate() {
+                    if i == target_idx {
+                        continue;
+                    }
+                    let take = ((wallet.balance as f64 * frac).floor() as u64).min(wallet.balance);
+                    wallet.balance -= take;
+                    moved = moved.saturating_add(take);
+                    wallet.iteration_tx_count += 1;
+                    wallet.iteration_counterparties.insert(target_id.clone());
+                }
+                wallets[target_idx].balance = wallets[target_idx].balance.saturating_add(moved);
+                wallets[target_idx].iteration_tx_count += wallets.len() as u32 - 1;
+            }
+            _ => {}
+        }
+    }
+    extra_txs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scripted_spawn_and_burst_events_take_effect() {
+        // SpawnWallets adds population at iteration 2; TransferBurst injects activity at 3.
+        // The metrics row for iter 3 must show extra n_txs and the row for iter 2 must show
+        // a higher wallet count than iter 1 (offset by the engine's own faucet growth).
+        let params = SystemParameters::default();
+        let events = vec![
+            ScriptedEvent::SpawnWallets {
+                at_iteration: 2,
+                count: 50,
+                balance: Some(20_000_000),
+            },
+            ScriptedEvent::TransferBurst {
+                at_iteration: 3,
+                n_txs: 200,
+                fraction: Some(0.10),
+            },
+        ];
+        let config = SimConfig {
+            iterations: 4,
+            initial_wallets: 20,
+            tx_per_wallet_mean: 0.0,
+            scripted_events: events,
+            ..SimConfig::default()
+        };
+        let rows = run_simulation(&params, &config).unwrap();
+        assert!(rows[1].n_wallets >= 70, "spawn_wallets must add at least 50 wallets in iter 2");
+        assert!(rows[2].n_txs >= 100, "transfer_burst must inject substantial activity in iter 3");
+    }
 
     #[test]
     fn simulation_is_deterministic_and_bounded() {
